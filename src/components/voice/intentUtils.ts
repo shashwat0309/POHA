@@ -58,6 +58,10 @@ export function normalizeTokenSymbol(value?: string | null) {
     .trim()
   if (v === 'weth') return 'WETH'
   if (v === 'eth') return 'ETH'
+  if (v === 'matic' || v === 'polygon') return 'MATIC'
+  if (v === 'bnb' || v === 'binance') return 'BNB'
+  if (v === 'avax' || v === 'avalanche') return 'AVAX'
+  if (v === 'sol' || v === 'solana') return 'SOL'
   if (v === 'usdt' || v === 'tether' || v === 'usdts') return 'USDT'
   if (v === 'usdc') return 'USDC'
   if (v === 'dai') return 'DAI'
@@ -82,20 +86,22 @@ export function normalizeChainAlias(value?: string | null) {
 export function extractLocalIntent(text: string): Partial<Intent> {
   const out: Partial<Intent> = {}
   const t = (text || '').toLowerCase()
-  const amtToken = t.match(/\b(?:swap|bridge)\s+(\d+(?:[.,]\d+)?)\s*([a-z][a-z0-9]*)/i)
+  // Amount + token (supports swap/convert/change/exchange/bridge verbs)
+  const amtToken = t.match(/\b(?:swap|convert|change|exchange|bridge)\s+(\d+(?:[.,]\d+)?)\s*([a-z][a-z0-9]*)/i)
   if (amtToken) {
     const amt = parseFloat(amtToken[1].replace(',', '.'))
     if (!isNaN(amt)) out.amount = amt
     out.source_token = normalizeTokenSymbol(amtToken[2])
   }
-  const pair = t.match(/\b(?:swap|convert)\s+([a-z][a-z0-9]*)\s+(?:to|into|for)\s+([a-z][a-z0-9]*)/i)
+  // Token pair
+  const pair = t.match(/\b(?:swap|convert|change|exchange)\s+([a-z][a-z0-9]*)\s+(?:to|into|for)\s+([a-z][a-z0-9]*)/i)
   if (pair) {
     out.source_token = normalizeTokenSymbol(pair[1])
     out.target_token = normalizeTokenSymbol(pair[2])
   }
   const tgt = t.match(/\b(?:get|receive|want to get|i want to get|i want)\s+([a-z][a-z0-9]*)/i)
   if (tgt) out.target_token = normalizeTokenSymbol(tgt[1])
-  const srcOnly = !out.source_token && t.match(/\b(?:swap|sell|bridge)\s+([a-z][a-z0-9]*)/i)
+  const srcOnly = !out.source_token && t.match(/\b(?:swap|sell|bridge|convert|change|exchange)\s+([a-z][a-z0-9]*)/i)
   if (srcOnly) out.source_token = normalizeTokenSymbol(srcOnly[1])
   const onMatches = (() => {
     const re = /\bon\s+([a-z][\w\s-]*?)(?=\s|$|\.|,)/gi
@@ -117,8 +123,13 @@ export function extractLocalIntent(text: string): Partial<Intent> {
   }
   const fromChain = t.match(/\bfrom\s+([a-z][\w\s-]*?)(?=\s|$|\.|,)/i)
   if (fromChain) out.source_chain = normalizeChainAlias(fromChain[1])
-  const toChain = t.match(/\bto\s+([a-z][\w\s-]*?)(?:\s+chain|\s+network)?\b(?!\s*(?:token|usdt|usdc|eth|dai|weth)\b)/i)
+  // When "to" is followed by a chain (and not a token symbol), capture it
+  const toChain = t.match(/\bto\s+([a-z][\w\s-]*?)(?:\s+chain|\s+network)?\b(?!\s*(?:token|usdt|usdc|eth|dai|weth|bnb|avax|sol|matic)\b)/i)
   if (toChain) out.target_chain = normalizeChainAlias(toChain[1])
+  // If only one chain is mentioned via "on X" and a token pair exists without an explicit second chain, treat it as source_chain
+  if (!out.source_chain && out.target_token && out.source_token && onMatches.length === 1) {
+    out.source_chain = onMatches[0]
+  }
   return out
 }
 

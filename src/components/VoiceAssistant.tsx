@@ -87,6 +87,8 @@ export default function VoiceAssistant({
   const [textInput, setTextInput] = useState('')
   const [liveTranscript, setLiveTranscript] = useState('')
   const [isTranscribing, setIsTranscribing] = useState(false)
+  const [isSpeaking, setIsSpeaking] = useState(false)
+  const [lastResponse, setLastResponse] = useState('')
   const { status: execStatus, execute, reset: resetExec } =
     useRouteExecution({
       onUpdate: () => {
@@ -100,7 +102,7 @@ export default function VoiceAssistant({
 
   // Check if the transcript is asking for wallet holdings
   const isWalletHoldingsQuery = useCallback((text: string) => {
-    const t = text.toLowerCase()
+    const t = (typeof text === 'string' ? text : '').toLowerCase()
     return /\b(show|display|what|check|view|see|tell me|list|what are)\b.*\b(wallet|balance|balances|holdings|portfolio|tokens|assets|funds)\b/.test(t) ||
       /\b(my|current|wallet)\b.*\b(balance|balances|holdings|portfolio|tokens|assets)\b/.test(t) ||
       /\b(what do i have|what tokens do i have|show my tokens|my tokens|my assets|my holdings|my portfolio)\b/.test(t) ||
@@ -109,14 +111,14 @@ export default function VoiceAssistant({
 
   // Check if asking for specific token balance
   const isSpecificTokenQuery = useCallback((text: string) => {
-    const t = text.toLowerCase()
+    const t = (typeof text === 'string' ? text : '').toLowerCase()
     return /\b(how many|how much|what is my|what's my|check my)\b.*\b(usdt|usdc|eth|btc|matic|dai|weth|tokens?|balance)\b/.test(t) ||
       /\b(balance of|amount of)\b.*\b(usdt|usdc|eth|btc|matic|dai|weth)\b/.test(t)
   }, [])
 
   // Extract token symbol from query
   const extractTokenFromQuery = useCallback((text: string) => {
-    const t = text.toLowerCase()
+    const t = (typeof text === 'string' ? text : '').toLowerCase()
     const tokenMatch = t.match(/\b(usdt|usdc|eth|btc|matic|dai|weth|bitcoin|ethereum|tether|usd coin)\b/)
     if (!tokenMatch) return null
 
@@ -133,10 +135,18 @@ export default function VoiceAssistant({
   const speak = useCallback((text: string, lang: string = 'en-IN') => {
     try {
       if (!text) return
+      // Mirror spoken text in UI
+      setLastResponse(text)
       // Cancel any queued utterances to avoid piling up
       window.speechSynthesis.cancel()
       const utter = new SpeechSynthesisUtterance(text)
       utter.lang = lang
+
+      // Track speaking state
+      utter.onstart = () => setIsSpeaking(true)
+      utter.onend = () => setIsSpeaking(false)
+      utter.onerror = () => setIsSpeaking(false)
+
       const pickVoice = () => {
         const list = window.speechSynthesis.getVoices() || []
         const preferred =
@@ -157,6 +167,7 @@ export default function VoiceAssistant({
       }
     } catch (e) {
       console.warn('speak failed', e)
+      setIsSpeaking(false)
     }
   }, [])
 
@@ -165,6 +176,296 @@ export default function VoiceAssistant({
   // Derived completeness not used in UI currently
 
   // next question computed per-merge to avoid stale reads
+
+  // Token balance checker (declare early to avoid TDZ in dependencies)
+  const getSpecificTokenBalance = useCallback(async (tokenSymbol: string) => {
+    const eth = typeof window !== 'undefined' ? (window as any).ethereum : null
+    if (!eth) {
+      speak('Please connect your wallet first to check your token balance.')
+      return
+    }
+
+    try {
+      const accounts = await eth.request({ method: 'eth_accounts' })
+      if (!accounts || accounts.length === 0) {
+        speak('Please connect your wallet first to check your token balance.')
+        return
+      }
+
+      setStatus('processing')
+      speak(`Checking your ${tokenSymbol} balance...`)
+
+      const walletBalances = await getWalletBalances(accounts[0])
+      let totalBalance = 0
+      let totalUsdValue = 0
+      let foundToken = false
+
+      // Search across all chains for the token
+      Object.entries(walletBalances).forEach(([chainId, tokens]) => {
+        tokens.forEach((token: any) => {
+          if (token.symbol?.toUpperCase() === tokenSymbol.toUpperCase()) {
+            foundToken = true
+            const amount = Number(formatAmountDisplay(token.amount, token.decimals))
+            totalBalance += amount
+            if (token.priceUSD) {
+              totalUsdValue += amount * Number(token.priceUSD)
+            }
+          }
+        })
+      })
+
+      if (!foundToken) {
+        speak(`You don't have any ${tokenSymbol} tokens in your wallet.`)
+      } else {
+        let response = `You have ${totalBalance.toLocaleString()} ${tokenSymbol}`
+        if (totalUsdValue > 0) {
+          response += ` worth approximately $${totalUsdValue.toFixed(2)}`
+        }
+        response += ' in your wallet.'
+        speak(response)
+      }
+    } catch (error) {
+      console.error('Failed to get token balance:', error)
+      speak(`Sorry, I couldn't check your ${tokenSymbol} balance. Please try again.`)
+    } finally {
+      setStatus('idle')
+    }
+  }, [speak])
+
+  // Stop speaking function
+  const stopSpeaking = useCallback(() => {
+    window.speechSynthesis.cancel()
+    setIsSpeaking(false)
+  }, [])
+
+  // Process current live transcript
+  const processCurrentTranscript = useCallback(async () => {
+    if (!liveTranscript.trim()) return
+
+    // Stop current recording
+    const rec = recorderRef.current
+    if (rec) {
+      try {
+        await rec.stop()
+        recorderRef.current = null
+      } catch (e) {
+        console.warn('Failed to stop recording:', e)
+      }
+    }
+
+    // Stop live transcription
+    const recognition = (recorderRef as any).recognition
+    if (recognition) {
+      recognition.stop()
+        ; (recorderRef as any).recognition = null
+    }
+    setIsTranscribing(false)
+
+    // Process the current live transcript
+    setStatus('processing')
+    const finalText = liveTranscript.trim()
+    setTranscript(finalText)
+    setLiveTranscript('')
+
+    try {
+      // Check if user is asking for specific token balance
+      if (isSpecificTokenQuery(finalText)) {
+        const tokenSymbol = extractTokenFromQuery(finalText)
+        if (tokenSymbol) {
+          await getSpecificTokenBalance(tokenSymbol)
+        } else {
+          speak('Which token balance would you like to check?')
+        }
+        setStatus('idle')
+        return
+      }
+
+      // Check if user is asking for wallet holdings
+      if (isWalletHoldingsQuery(finalText)) {
+        // Check if wallet is connected via browser
+        const eth = typeof window !== 'undefined' ? (window as any).ethereum : null
+        if (!eth) {
+          speak('Please connect your wallet first to view your holdings.')
+        } else {
+          try {
+            const accounts = await eth.request({ method: 'eth_accounts' })
+            if (!accounts || accounts.length === 0) {
+              speak('Please connect your wallet first to view your holdings.')
+            } else {
+              setShowWalletHoldings(true)
+              speak('Here are your current wallet holdings.')
+            }
+          } catch (error) {
+            speak('Please connect your wallet first to view your holdings.')
+          }
+        }
+        setStatus('idle')
+        return
+      }
+
+      const local = extractLocalIntent(finalText)
+
+      const intentRes = await fetch('/api/intent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: finalText }),
+      })
+      const { intent: intentStr } = await intentRes.json()
+      const newIntent: Intent = JSON.parse(intentStr)
+
+      const merged: Intent = {
+        source_token: newIntent.source_token || local.source_token || intent.source_token,
+        target_token: newIntent.target_token || local.target_token || intent.target_token,
+        amount:
+          typeof newIntent.amount === 'number'
+            ? newIntent.amount
+            : typeof local.amount === 'number'
+              ? local.amount
+              : intent.amount,
+        source_chain: newIntent.source_chain || local.source_chain || intent.source_chain,
+        target_chain: newIntent.target_chain || local.target_chain || intent.target_chain,
+      }
+      setIntent(merged)
+
+      if (
+        merged.source_token &&
+        merged.target_token &&
+        merged.amount &&
+        merged.source_chain &&
+        merged.target_chain
+      ) {
+        try {
+          const sourceChainName = normalizeChainAlias(merged.source_chain)
+          const targetChainName = normalizeChainAlias(merged.target_chain)
+          const fromChainId = CHAIN_IDS[sourceChainName]
+          const toChainId = CHAIN_IDS[targetChainName] ?? fromChainId
+
+          const fromSymbol = normalizeTokenSymbol(merged.source_token)
+          const toSymbol = normalizeTokenSymbol(merged.target_token)
+
+          if (!fromChainId) {
+            speak('On which source chain should I look?')
+            setStatus('idle')
+            return
+          }
+          const [fromToken, toToken] = await Promise.all([
+            resolveToken(fromChainId, fromSymbol),
+            toChainId ? resolveToken(toChainId, toSymbol) : Promise.resolve(undefined),
+          ])
+
+          if (!fromToken || !toToken) {
+            const offline = typeof navigator !== 'undefined' && navigator && navigator.onLine === false
+            speak(
+              offline
+                ? 'Network looks offline. Please check your connection and try again.'
+                : 'I could not resolve the tokens. Please try again.'
+            )
+            setStatus('idle')
+            return
+          }
+
+          if (!toChainId) {
+            speak('On which destination chain should I send it?')
+            setStatus('idle')
+            return
+          }
+          const msg =
+            'You want to ' +
+            (fromSymbol === toSymbol && fromChainId !== toChainId ? 'bridge ' : 'swap ') +
+            merged.amount +
+            ' ' +
+            fromSymbol +
+            ' on ' +
+            (sourceChainName || '') +
+            ' to ' +
+            toSymbol +
+            (toChainId !== fromChainId ? ' on ' + (targetChainName || '') : '') +
+            '. Should I proceed to find the best route?'
+          setProposal({
+            fromChainId,
+            toChainId,
+            fromSymbol,
+            toSymbol,
+            amount: merged.amount,
+            sourceChainName,
+            targetChainName,
+            fromTokenAddress: fromToken.address,
+            toTokenAddress: toToken.address,
+          })
+          speak(msg)
+          // Voice confirmation will be handled by the existing system
+        } catch (e) {
+          console.error(e)
+          speak('Something went wrong understanding your request.')
+        }
+      } else {
+        const nextQ = !merged.source_token
+          ? 'Which token do you want to swap from?'
+          : !merged.target_token
+            ? 'Which token do you want to receive?'
+            : !merged.amount
+              ? 'How much do you want to swap?'
+              : !merged.source_chain
+                ? 'On which source chain?'
+                : !merged.target_chain
+                  ? 'On which destination chain?'
+                  : ''
+        if (nextQ) speak(nextQ)
+      }
+    } catch (error) {
+      console.error('Processing failed:', error)
+      speak('Something went wrong processing your request.')
+    } finally {
+      setStatus('idle')
+    }
+  }, [liveTranscript, isSpecificTokenQuery, extractTokenFromQuery, getSpecificTokenBalance, isWalletHoldingsQuery, speak, extractLocalIntent, intent, normalizeChainAlias, CHAIN_IDS, normalizeTokenSymbol, resolveToken])
+
+  // Real-time speech recognition for live transcription (must be declared before use)
+  const startLiveTranscription = useCallback(() => {
+    if (typeof window === 'undefined' || (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window))) {
+      console.warn('Speech recognition not supported in this browser')
+      return null
+    }
+
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+    const recognition = new SpeechRecognition()
+
+    recognition.continuous = true
+    recognition.interimResults = true
+    recognition.lang = 'en-US'
+
+    recognition.onstart = () => {
+      setIsTranscribing(true)
+      setLiveTranscript('')
+    }
+
+    recognition.onresult = (event: any) => {
+      let interimTranscript = ''
+      let finalTranscript = ''
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const transcript = event.results[i][0].transcript
+        if (event.results[i].isFinal) {
+          finalTranscript += transcript
+        } else {
+          interimTranscript += transcript
+        }
+      }
+
+      setLiveTranscript(finalTranscript + interimTranscript)
+    }
+
+    recognition.onerror = (event: any) => {
+      console.error('Speech recognition error:', event.error)
+      setIsTranscribing(false)
+    }
+
+    recognition.onend = () => {
+      setIsTranscribing(false)
+    }
+
+    return recognition
+  }, [])
 
   const startRecording = useCallback(async () => {
     if (status !== 'idle') return
@@ -217,10 +518,10 @@ export default function VoiceAssistant({
 
         const res = await fetch('/api/transcribe', { method: 'POST', body: formData })
         const { text } = await res.json()
-        finalText = text
+        finalText = typeof text === 'string' ? text : ''
       }
 
-      setTranscript(finalText)
+      setTranscript(typeof finalText === 'string' ? finalText : '')
       setLiveTranscript('')
 
       // Check if user is asking for specific token balance
@@ -534,106 +835,9 @@ export default function VoiceAssistant({
     }
   }, [textInput, isWalletHoldingsQuery, speak, extractLocalIntent, intent, normalizeChainAlias, CHAIN_IDS, normalizeTokenSymbol, resolveToken])
 
-  const getSpecificTokenBalance = useCallback(async (tokenSymbol: string) => {
-    const eth = typeof window !== 'undefined' ? (window as any).ethereum : null
-    if (!eth) {
-      speak('Please connect your wallet first to check your token balance.')
-      return
-    }
+  // moved earlier
 
-    try {
-      const accounts = await eth.request({ method: 'eth_accounts' })
-      if (!accounts || accounts.length === 0) {
-        speak('Please connect your wallet first to check your token balance.')
-        return
-      }
-
-      setStatus('processing')
-      speak(`Checking your ${tokenSymbol} balance...`)
-
-      const walletBalances = await getWalletBalances(accounts[0])
-      let totalBalance = 0
-      let totalUsdValue = 0
-      let foundToken = false
-
-      // Search across all chains for the token
-      Object.entries(walletBalances).forEach(([chainId, tokens]) => {
-        tokens.forEach((token: any) => {
-          if (token.symbol?.toUpperCase() === tokenSymbol.toUpperCase()) {
-            foundToken = true
-            const amount = Number(formatAmountDisplay(token.amount, token.decimals))
-            totalBalance += amount
-            if (token.priceUSD) {
-              totalUsdValue += amount * Number(token.priceUSD)
-            }
-          }
-        })
-      })
-
-      if (!foundToken) {
-        speak(`You don't have any ${tokenSymbol} tokens in your wallet.`)
-      } else {
-        let response = `You have ${totalBalance.toLocaleString()} ${tokenSymbol}`
-        if (totalUsdValue > 0) {
-          response += ` worth approximately $${totalUsdValue.toFixed(2)}`
-        }
-        response += ' in your wallet.'
-        speak(response)
-      }
-    } catch (error) {
-      console.error('Failed to get token balance:', error)
-      speak(`Sorry, I couldn't check your ${tokenSymbol} balance. Please try again.`)
-    } finally {
-      setStatus('idle')
-    }
-  }, [speak])
-
-  // Real-time speech recognition for live transcription
-  const startLiveTranscription = useCallback(() => {
-    if (typeof window === 'undefined' || (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window))) {
-      console.warn('Speech recognition not supported in this browser')
-      return null
-    }
-
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
-    const recognition = new SpeechRecognition()
-
-    recognition.continuous = true
-    recognition.interimResults = true
-    recognition.lang = 'en-US'
-
-    recognition.onstart = () => {
-      setIsTranscribing(true)
-      setLiveTranscript('')
-    }
-
-    recognition.onresult = (event: any) => {
-      let interimTranscript = ''
-      let finalTranscript = ''
-
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript
-        if (event.results[i].isFinal) {
-          finalTranscript += transcript
-        } else {
-          interimTranscript += transcript
-        }
-      }
-
-      setLiveTranscript(finalTranscript + interimTranscript)
-    }
-
-    recognition.onerror = (event: any) => {
-      console.error('Speech recognition error:', event.error)
-      setIsTranscribing(false)
-    }
-
-    recognition.onend = () => {
-      setIsTranscribing(false)
-    }
-
-    return recognition
-  }, [])
+  // startLiveTranscription moved above to avoid temporal dead zone
 
   // Listen for available routes and selection to show a small best route card
   useEffect(() => {
@@ -1057,7 +1261,14 @@ export default function VoiceAssistant({
                   <span />
                 </span>
               ) : (
-                transcript ? 'You said: ' + transcript : 'Press Space to talk or T to type'
+                (transcript || lastResponse) ? (
+                  <span>
+                    {transcript ? <span className="va-user">You said: {transcript}</span> : null}
+                    {lastResponse ? (
+                      <span className="va-reply">Assistant: {lastResponse}</span>
+                    ) : null}
+                  </span>
+                ) : 'Press Space to talk or T to type'
               )}
             </div>
           </div>
@@ -1077,6 +1288,34 @@ export default function VoiceAssistant({
               <path d="M12 18v3" stroke="currentColor" strokeWidth="1.5" />
             </svg>
           </button>
+
+          {/* Process current transcript button - shows when listening and has transcript */}
+          {status === 'listening' && liveTranscript.trim() && (
+            <button
+              className="va-process"
+              onClick={processCurrentTranscript}
+              aria-label="Process current transcript"
+            >
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M9 12l2 2 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.5" />
+              </svg>
+            </button>
+          )}
+
+          {/* Stop speaking button - shows when speaking */}
+          {isSpeaking && (
+            <button
+              className="va-stop-speaking"
+              onClick={stopSpeaking}
+              aria-label="Stop speaking"
+            >
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
+              </svg>
+            </button>
+          )}
+
           <button
             className={"va-keyboard" + (showTextInput ? ' active' : '')}
             onClick={() => setShowTextInput(!showTextInput)}
@@ -1218,7 +1457,9 @@ export default function VoiceAssistant({
         .va-left { display: flex; gap: 12px; align-items: center; min-width: 0; }
         .va-text { overflow: hidden; }
         .va-title { font-weight: 600; font-size: 14px; letter-spacing: .02em; text-transform: uppercase; opacity: .95; }
-        .va-subtitle { font-size: 13px; opacity: .8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .va-subtitle { font-size: 13px; opacity: .8; display: flex; flex-direction: column; gap: 2px; max-width: 560px; }
+        .va-user { opacity: .8; }
+        .va-reply { color: #e2e8f0; opacity: .95; }
         .va-actions { display: flex; gap: 8px; }
         .va-mic, .va-stop { width: 44px; height: 44px; border-radius: 999px; display: grid; place-items: center; border: 1px solid rgba(255,255,255,0.12); color: #fff; cursor: pointer; transition: transform .12s ease, background .2s ease, box-shadow .2s ease; }
         .va-mic { background: radial-gradient(100% 100% at 0% 0%, #4F46E5 0%, #0EA5E9 100%); box-shadow: 0 6px 16px rgba(14,165,233,0.35); }
@@ -1228,6 +1469,12 @@ export default function VoiceAssistant({
         .va-keyboard { width: 44px; height: 44px; border-radius: 999px; display: grid; place-items: center; border: 1px solid rgba(255,255,255,0.12); color: #fff; cursor: pointer; transition: transform .12s ease, background .2s ease, box-shadow .2s ease; background: rgba(255,255,255,0.08); }
         .va-keyboard:hover { transform: translateY(-1px); background: rgba(255,255,255,0.12); }
         .va-keyboard.active { background: radial-gradient(100% 100% at 0% 0%, #10b981 0%, #059669 100%); box-shadow: 0 6px 16px rgba(16,185,129,0.35); }
+        .va-process { width: 44px; height: 44px; border-radius: 999px; display: grid; place-items: center; border: 1px solid rgba(255,255,255,0.12); color: #fff; cursor: pointer; transition: transform .12s ease, background .2s ease, box-shadow .2s ease; background: radial-gradient(100% 100% at 0% 0%, #10b981 0%, #059669 100%); box-shadow: 0 6px 16px rgba(16,185,129,0.35); animation: pulse-green 2s ease-in-out infinite; }
+        .va-process:hover { transform: translateY(-1px); }
+        .va-stop-speaking { width: 44px; height: 44px; border-radius: 999px; display: grid; place-items: center; border: 1px solid rgba(255,255,255,0.12); color: #fff; cursor: pointer; transition: transform .12s ease, background .2s ease, box-shadow .2s ease; background: radial-gradient(100% 100% at 0% 0%, #ef4444 0%, #dc2626 100%); box-shadow: 0 6px 16px rgba(239,68,68,0.35); animation: pulse-red 1.5s ease-in-out infinite; }
+        .va-stop-speaking:hover { transform: translateY(-1px); }
+        @keyframes pulse-green { 0%, 100% { box-shadow: 0 6px 16px rgba(16,185,129,0.35); } 50% { box-shadow: 0 6px 20px rgba(16,185,129,0.6); } }
+        @keyframes pulse-red { 0%, 100% { box-shadow: 0 6px 16px rgba(239,68,68,0.35); } 50% { box-shadow: 0 6px 20px rgba(239,68,68,0.6); } }
         .va-orb { position: relative; width: 40px; height: 40px; }
         .va-orb .core { position: absolute; inset: 8px; border-radius: 999px; background: radial-gradient(100% 100% at 30% 30%, #89f 0%, #59f 30%, #3b82f6 70%, #0ea5e9 100%); box-shadow: inset 0 0 20px rgba(255,255,255,0.5), 0 2px 10px rgba(59,130,246,0.35); animation: orb-breathe 2.4s ease-in-out infinite; }
         .va-orb.listening .core { animation-duration: 1.6s; }

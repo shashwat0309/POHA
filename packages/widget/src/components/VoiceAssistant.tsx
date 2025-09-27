@@ -12,6 +12,7 @@ type Intent = {
 export default function VoiceAssistant() {
   const [status, setStatus] = useState('idle');
   const [transcript, setTranscript] = useState('');
+  const [lastResponse, setLastResponse] = useState('');
   const [intent, setIntent] = useState<Intent>({
     source_token: null,
     target_token: null,
@@ -20,6 +21,9 @@ export default function VoiceAssistant() {
   });
 
   const speak = (text: string, lang: string = 'en-IN') => {
+    if (!text) return;
+    // Mirror assistant response in UI
+    setLastResponse(text);
     const utter = new SpeechSynthesisUtterance(text);
     utter.lang = lang;
     speechSynthesis.speak(utter);
@@ -90,7 +94,7 @@ export default function VoiceAssistant() {
   };
 
   return (
-    <div className="p-6 text-black space-y-4">
+    <div className="p-6 space-y-4" aria-live="polite">
       <button
         onClick={handleRecord}
         className="px-4 py-2 bg-blue-600 rounded-lg"
@@ -99,8 +103,15 @@ export default function VoiceAssistant() {
         {status === 'listening' ? 'Listening...' : 'Speak'}
       </button>
 
-      {transcript && (
-        <p className="text-sm text-gray-300">You said: {transcript}</p>
+      {(transcript || lastResponse) && (
+        <div className="text-sm space-y-1">
+          {transcript ? (
+            <p className="text-gray-200">You said: {transcript}</p>
+          ) : null}
+          {lastResponse ? (
+            <p className="text-gray-100">Assistant: {lastResponse}</p>
+          ) : null}
+        </div>
       )}
 
       <pre className="bg-black/40 p-4 rounded-lg text-green-300 text-sm">
