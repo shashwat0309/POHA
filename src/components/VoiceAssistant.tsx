@@ -89,6 +89,62 @@ export default function VoiceAssistant({
   const [isTranscribing, setIsTranscribing] = useState(false)
   const [isSpeaking, setIsSpeaking] = useState(false)
   const [lastResponse, setLastResponse] = useState('')
+  const [messages, setMessages] = useState<{ role: 'user' | 'assistant'; text: string; ts: number }[]>([])
+  const [pendingField, setPendingField] = useState<keyof Intent | null>(null)
+
+  // Chat history helpers
+  const addUserMessage = useCallback((text: string) => {
+    const t = (typeof text === 'string' ? text : '').trim()
+    if (!t) return
+    setMessages((prev) => [...prev, { role: 'user', text: t, ts: Date.now() }])
+  }, [])
+  const addAssistantMessage = useCallback((text: string) => {
+    const t = (typeof text === 'string' ? text : '').trim()
+    if (!t) return
+    setMessages((prev) => [...prev, { role: 'assistant', text: t, ts: Date.now() }])
+  }, [])
+
+  // Helpers to interpret short answers for the pending field prompt
+  const parsePendingAnswer = useCallback(
+    (text: string): Partial<Intent> => {
+      const t = (typeof text === 'string' ? text : '').trim()
+      if (!pendingField || !t) return {}
+      if (pendingField === 'source_token' || pendingField === 'target_token') {
+        return { [pendingField]: normalizeTokenSymbol(t) } as Partial<Intent>
+      }
+      if (pendingField === 'amount') {
+        const m = t.match(/\d+(?:[.,]\d+)?/)
+        if (m) {
+          const n = parseFloat(m[0].replace(',', '.'))
+          if (!isNaN(n)) return { amount: n }
+        }
+        return {}
+      }
+      if (pendingField === 'source_chain' || pendingField === 'target_chain') {
+        return { [pendingField]: normalizeChainAlias(t) } as Partial<Intent>
+      }
+      return {}
+    },
+    [pendingField]
+  )
+
+  // Decide which field is missing and the corresponding question
+  const getMissingField = useCallback((i: Intent): keyof Intent | null => {
+    if (!i.source_token) return 'source_token'
+    if (!i.target_token) return 'target_token'
+    if (!i.amount) return 'amount'
+    if (!i.source_chain) return 'source_chain'
+    if (!i.target_chain) return 'target_chain'
+    return null
+  }, [])
+
+  const questionForField: Record<keyof Intent, string> = {
+    source_token: 'Which token do you want to swap from?',
+    target_token: 'Which token do you want to receive?',
+    amount: 'How much do you want to swap?',
+    source_chain: 'On which source chain?',
+    target_chain: 'On which destination chain?'
+  }
   const { status: execStatus, execute, reset: resetExec } =
     useRouteExecution({
       onUpdate: () => {
@@ -137,6 +193,7 @@ export default function VoiceAssistant({
       if (!text) return
       // Mirror spoken text in UI
       setLastResponse(text)
+      addAssistantMessage(text)
       // Cancel any queued utterances to avoid piling up
       window.speechSynthesis.cancel()
       const utter = new SpeechSynthesisUtterance(text)
@@ -169,6 +226,28 @@ export default function VoiceAssistant({
       console.warn('speak failed', e)
       setIsSpeaking(false)
     }
+  }, [addAssistantMessage])
+
+  // Clear chat/history and reset UI state
+  const clearHistory = useCallback(() => {
+    try {
+      window.speechSynthesis?.cancel()
+    } catch {}
+    setMessages([])
+    setTranscript('')
+    setLastResponse('')
+    setPendingField(null)
+    setProposal(null)
+    setExecProposal(null)
+    setExecAsking(false)
+    setEnsPromptVisible(false)
+    setSolPromptVisible(false)
+    setShowTextInput(false)
+    setTextInput('')
+    setLiveTranscript('')
+    setIsTranscribing(false)
+    setIsSpeaking(false)
+    setStatus('idle')
   }, [])
 
   // English-only: no language switching
@@ -265,6 +344,7 @@ export default function VoiceAssistant({
     setStatus('processing')
     const finalText = liveTranscript.trim()
     setTranscript(finalText)
+    addUserMessage(finalText)
     setLiveTranscript('')
 
     try {
@@ -304,6 +384,10 @@ export default function VoiceAssistant({
       }
 
       const local = extractLocalIntent(finalText)
+      const pendingPatch = parsePendingAnswer(finalText)
+      if (Object.keys(pendingPatch).length) {
+        setPendingField(null)
+      }
 
       const intentRes = await fetch('/api/intent', {
         method: 'POST',
@@ -314,16 +398,26 @@ export default function VoiceAssistant({
       const newIntent: Intent = JSON.parse(intentStr)
 
       const merged: Intent = {
-        source_token: newIntent.source_token || local.source_token || intent.source_token,
-        target_token: newIntent.target_token || local.target_token || intent.target_token,
+        source_token:
+          (pendingPatch.source_token as string | null) ??
+          (newIntent.source_token ?? local.source_token ?? intent.source_token),
+        target_token:
+          (pendingPatch.target_token as string | null) ??
+          (newIntent.target_token ?? local.target_token ?? intent.target_token),
         amount:
-          typeof newIntent.amount === 'number'
-            ? newIntent.amount
-            : typeof local.amount === 'number'
-              ? local.amount
-              : intent.amount,
-        source_chain: newIntent.source_chain || local.source_chain || intent.source_chain,
-        target_chain: newIntent.target_chain || local.target_chain || intent.target_chain,
+          typeof pendingPatch.amount === 'number'
+            ? pendingPatch.amount
+            : typeof newIntent.amount === 'number'
+              ? newIntent.amount
+              : typeof local.amount === 'number'
+                ? local.amount
+                : intent.amount,
+        source_chain:
+          (pendingPatch.source_chain as string | null) ??
+          (newIntent.source_chain ?? local.source_chain ?? intent.source_chain),
+        target_chain:
+          (pendingPatch.target_chain as string | null) ??
+          (newIntent.target_chain ?? local.target_chain ?? intent.target_chain),
       }
       setIntent(merged)
 
@@ -399,18 +493,11 @@ export default function VoiceAssistant({
           speak('Something went wrong understanding your request.')
         }
       } else {
-        const nextQ = !merged.source_token
-          ? 'Which token do you want to swap from?'
-          : !merged.target_token
-            ? 'Which token do you want to receive?'
-            : !merged.amount
-              ? 'How much do you want to swap?'
-              : !merged.source_chain
-                ? 'On which source chain?'
-                : !merged.target_chain
-                  ? 'On which destination chain?'
-                  : ''
-        if (nextQ) speak(nextQ)
+        const missing = getMissingField(merged)
+        if (missing) {
+          setPendingField(missing)
+          speak(questionForField[missing])
+        }
       }
     } catch (error) {
       console.error('Processing failed:', error)
@@ -418,7 +505,7 @@ export default function VoiceAssistant({
     } finally {
       setStatus('idle')
     }
-  }, [liveTranscript, isSpecificTokenQuery, extractTokenFromQuery, getSpecificTokenBalance, isWalletHoldingsQuery, speak, extractLocalIntent, intent, normalizeChainAlias, CHAIN_IDS, normalizeTokenSymbol, resolveToken])
+  }, [liveTranscript, isSpecificTokenQuery, extractTokenFromQuery, getSpecificTokenBalance, isWalletHoldingsQuery, speak, extractLocalIntent, intent, normalizeChainAlias, CHAIN_IDS, normalizeTokenSymbol, resolveToken, parsePendingAnswer, getMissingField])
 
   // Real-time speech recognition for live transcription (must be declared before use)
   const startLiveTranscription = useCallback(() => {
@@ -522,6 +609,7 @@ export default function VoiceAssistant({
       }
 
       setTranscript(typeof finalText === 'string' ? finalText : '')
+      addUserMessage(typeof finalText === 'string' ? finalText : '')
       setLiveTranscript('')
 
       // Check if user is asking for specific token balance
@@ -570,16 +658,26 @@ export default function VoiceAssistant({
       const newIntent: Intent = JSON.parse(intentStr)
 
       const merged: Intent = {
-        source_token: newIntent.source_token || local.source_token || intent.source_token,
-        target_token: newIntent.target_token || local.target_token || intent.target_token,
+        source_token:
+          (pendingPatch.source_token as string | null) ??
+          (newIntent.source_token ?? local.source_token ?? intent.source_token),
+        target_token:
+          (pendingPatch.target_token as string | null) ??
+          (newIntent.target_token ?? local.target_token ?? intent.target_token),
         amount:
-          typeof newIntent.amount === 'number'
-            ? newIntent.amount
-            : typeof local.amount === 'number'
-              ? local.amount
-              : intent.amount,
-        source_chain: newIntent.source_chain || local.source_chain || intent.source_chain,
-        target_chain: newIntent.target_chain || local.target_chain || intent.target_chain,
+          typeof pendingPatch.amount === 'number'
+            ? pendingPatch.amount
+            : typeof newIntent.amount === 'number'
+              ? newIntent.amount
+              : typeof local.amount === 'number'
+                ? local.amount
+                : intent.amount,
+        source_chain:
+          (pendingPatch.source_chain as string | null) ??
+          (newIntent.source_chain ?? local.source_chain ?? intent.source_chain),
+        target_chain:
+          (pendingPatch.target_chain as string | null) ??
+          (newIntent.target_chain ?? local.target_chain ?? intent.target_chain),
       }
       setIntent(merged)
 
@@ -655,23 +753,16 @@ export default function VoiceAssistant({
           speak('Something went wrong understanding your request.')
         }
       } else {
-        const nextQ = !merged.source_token
-          ? 'Which token do you want to swap from?'
-          : !merged.target_token
-            ? 'Which token do you want to receive?'
-            : !merged.amount
-              ? 'How much do you want to swap?'
-              : !merged.source_chain
-                ? 'On which source chain?'
-                : !merged.target_chain
-                  ? 'On which destination chain?'
-                  : ''
-        if (nextQ) speak(nextQ)
+        const missing = getMissingField(merged)
+        if (missing) {
+          setPendingField(missing)
+          speak(questionForField[missing])
+        }
       }
     } finally {
       setStatus('idle')
     }
-  }, [transcribeLang, intent, speak, liveTranscript, isSpecificTokenQuery, extractTokenFromQuery, getSpecificTokenBalance, isWalletHoldingsQuery, extractLocalIntent])
+  }, [transcribeLang, intent, speak, liveTranscript, isSpecificTokenQuery, extractTokenFromQuery, getSpecificTokenBalance, isWalletHoldingsQuery, extractLocalIntent, parsePendingAnswer, getMissingField])
 
   const processTextInput = useCallback(async () => {
     if (!textInput.trim()) return
@@ -679,6 +770,7 @@ export default function VoiceAssistant({
     setStatus('processing')
     const text = textInput.trim()
     setTranscript(text)
+    addUserMessage(text)
     setTextInput('')
     setShowTextInput(false)
 
@@ -719,6 +811,10 @@ export default function VoiceAssistant({
       }
 
       const local = extractLocalIntent(text)
+      const pendingPatch = parsePendingAnswer(text)
+      if (Object.keys(pendingPatch).length) {
+        setPendingField(null)
+      }
 
       const intentRes = await fetch('/api/intent', {
         method: 'POST',
@@ -729,16 +825,26 @@ export default function VoiceAssistant({
       const newIntent: Intent = JSON.parse(intentStr)
 
       const merged: Intent = {
-        source_token: newIntent.source_token || local.source_token || intent.source_token,
-        target_token: newIntent.target_token || local.target_token || intent.target_token,
+        source_token:
+          (pendingPatch.source_token as string | null) ??
+          (newIntent.source_token ?? local.source_token ?? intent.source_token),
+        target_token:
+          (pendingPatch.target_token as string | null) ??
+          (newIntent.target_token ?? local.target_token ?? intent.target_token),
         amount:
-          typeof newIntent.amount === 'number'
-            ? newIntent.amount
-            : typeof local.amount === 'number'
-              ? local.amount
-              : intent.amount,
-        source_chain: newIntent.source_chain || local.source_chain || intent.source_chain,
-        target_chain: newIntent.target_chain || local.target_chain || intent.target_chain,
+          typeof pendingPatch.amount === 'number'
+            ? pendingPatch.amount
+            : typeof newIntent.amount === 'number'
+              ? newIntent.amount
+              : typeof local.amount === 'number'
+                ? local.amount
+                : intent.amount,
+        source_chain:
+          (pendingPatch.source_chain as string | null) ??
+          (newIntent.source_chain ?? local.source_chain ?? intent.source_chain),
+        target_chain:
+          (pendingPatch.target_chain as string | null) ??
+          (newIntent.target_chain ?? local.target_chain ?? intent.target_chain),
       }
       setIntent(merged)
 
@@ -814,18 +920,11 @@ export default function VoiceAssistant({
           speak('Something went wrong understanding your request.')
         }
       } else {
-        const nextQ = !merged.source_token
-          ? 'Which token do you want to swap from?'
-          : !merged.target_token
-            ? 'Which token do you want to receive?'
-            : !merged.amount
-              ? 'How much do you want to swap?'
-              : !merged.source_chain
-                ? 'On which source chain?'
-                : !merged.target_chain
-                  ? 'On which destination chain?'
-                  : ''
-        if (nextQ) speak(nextQ)
+        const missing = getMissingField(merged)
+        if (missing) {
+          setPendingField(missing)
+          speak(questionForField[missing])
+        }
       }
     } catch (error) {
       console.error('Text processing failed:', error)
@@ -833,7 +932,7 @@ export default function VoiceAssistant({
     } finally {
       setStatus('idle')
     }
-  }, [textInput, isWalletHoldingsQuery, speak, extractLocalIntent, intent, normalizeChainAlias, CHAIN_IDS, normalizeTokenSymbol, resolveToken])
+  }, [textInput, isWalletHoldingsQuery, speak, extractLocalIntent, intent, normalizeChainAlias, CHAIN_IDS, normalizeTokenSymbol, resolveToken, addUserMessage, parsePendingAnswer, getMissingField])
 
   // moved earlier
 
@@ -1222,7 +1321,7 @@ export default function VoiceAssistant({
     } finally {
       setStatus('idle')
     }
-  }, [transcribeLang])
+  }, [transcribeLang, addUserMessage])
 
   return (
     <div className="va-root" aria-live="polite">
@@ -1262,16 +1361,32 @@ export default function VoiceAssistant({
                 </span>
               ) : (
                 (transcript || lastResponse) ? (
-                  <span>
-                    {transcript ? <span className="va-user">You said: {transcript}</span> : null}
+                  <>
+                    {transcript ? <div className="va-user">You said: {transcript}</div> : null}
                     {lastResponse ? (
-                      <span className="va-reply">Assistant: {lastResponse}</span>
+                      <div className="va-reply">Assistant: {lastResponse}</div>
                     ) : null}
-                  </span>
+                  </>
                 ) : 'Press Space to talk or T to type'
               )}
-            </div>
+      </div>
+    </div>
+
+      {/* Recent chat history */}
+      {messages.length > 0 && (
+        <div className="va-history">
+          <div className="va-history-head">
+            <span className="va-history-title">Recent</span>
+            <button className="va-btn small secondary" onClick={clearHistory} aria-label="Clear history">Clear</button>
           </div>
+          {messages.slice(-8).map((m, i) => (
+            <div key={m.ts + ':' + i} className={"va-msg " + (m.role === 'user' ? 'user' : 'assistant')}>
+              <span className="va-role">{m.role === 'user' ? 'You' : 'Assistant'}:</span>
+              <span className="va-text">{m.text}</span>
+            </div>
+          ))}
+        </div>
+      )}
         </div>
         <div className="va-actions">
           <button
@@ -1461,6 +1576,13 @@ export default function VoiceAssistant({
         .va-user { opacity: .8; }
         .va-reply { color: #e2e8f0; opacity: .95; }
         .va-actions { display: flex; gap: 8px; }
+        .va-history { pointer-events: auto; margin: 8px 0 0; padding: 8px 10px; border-radius: 12px; background: rgba(18,18,20,0.45); border: 1px solid rgba(255,255,255,0.08); max-height: 180px; overflow: auto; }
+        .va-history-head { display: flex; align-items: center; justify-content: space-between; padding: 2px 0 6px; }
+        .va-history-title { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; opacity: .7; }
+        .va-msg { display: flex; gap: 6px; font-size: 12.5px; line-height: 1.3; padding: 4px 0; }
+        .va-msg.user .va-role { color: #93c5fd; }
+        .va-msg.assistant .va-role { color: #a7f3d0; }
+        .va-msg .va-text { color: #e5e7eb; opacity: .95; }
         .va-mic, .va-stop { width: 44px; height: 44px; border-radius: 999px; display: grid; place-items: center; border: 1px solid rgba(255,255,255,0.12); color: #fff; cursor: pointer; transition: transform .12s ease, background .2s ease, box-shadow .2s ease; }
         .va-mic { background: radial-gradient(100% 100% at 0% 0%, #4F46E5 0%, #0EA5E9 100%); box-shadow: 0 6px 16px rgba(14,165,233,0.35); }
         .va-mic:hover { transform: translateY(-1px); }
