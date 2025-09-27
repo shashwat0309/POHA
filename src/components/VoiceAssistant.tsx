@@ -22,6 +22,7 @@ import { useRouteExecution } from './voice/useRouteExecution'
 import { ENSRecipientPrompt } from './voice/ENSRecipientPrompt'
 import { SolanaPrompt } from './voice/SolanaPrompt'
 import { WalletHoldings } from './voice/WalletHoldings'
+import { appendTx } from './TransactionHistory'
 
 // token resolution now provided by intentUtils.resolveToken
 
@@ -73,6 +74,20 @@ export default function VoiceAssistant({
   const recorderRef = useRef<Awaited<ReturnType<typeof recordAudio>> | null>(null)
   const keyDownRef = useRef(false)
   const widgetEvents = useWidgetEvents()
+  const spokenErrorRef = useRef<number>(0)
+  const isInsufficientFunds = useCallback((msg: string | undefined | null) => {
+    if (!msg) return false
+    const m = msg.toLowerCase()
+    return (
+      m.includes('insufficient') ||
+      m.includes('not enough') ||
+      m.includes('balance too low') ||
+      m.includes('insufficient balance') ||
+      m.includes('insufficient funds') ||
+      m.includes('gas too low') ||
+      m.includes('insufficient native token')
+    )
+  }, [])
   const [bestRoute, setBestRoute] = useState<Route | null>(null)
   const [execProposal, setExecProposal] = useState<Route | null>(null)
   const [execAsking, setExecAsking] = useState(false)
@@ -92,6 +107,8 @@ export default function VoiceAssistant({
   const [messages, setMessages] = useState<{ role: 'user' | 'assistant'; text: string; ts: number }[]>([])
   const [verified, setVerified] = useState(false)
   const [pendingField, setPendingField] = useState<keyof Intent | null>(null)
+  const autoExecuteRef = useRef(false)
+  const directSendRef = useRef<null | { amount: number; symbol: string; recipient: string }>(null)
 
   // Chat history helpers
   const addUserMessage = useCallback((text: string) => {
@@ -262,6 +279,12 @@ export default function VoiceAssistant({
     setIsTranscribing(false)
     setIsSpeaking(false)
     setStatus('idle')
+    // Reload the app to reset any external component state and providers
+    try {
+      if (typeof window !== 'undefined' && window.location) {
+        window.location.reload()
+      }
+    } catch {}
   }, [])
 
   // English-only: no language switching
@@ -630,9 +653,13 @@ export default function VoiceAssistant({
         finalText = typeof text === 'string' ? text : ''
       }
 
-      setTranscript(typeof finalText === 'string' ? finalText : '')
-      addUserMessage(typeof finalText === 'string' ? finalText : '')
+      const normalized = typeof finalText === 'string' ? finalText : ''
+      setTranscript(normalized)
+      setTextInput(normalized)
+      setShowTextInput(true)
       setLiveTranscript('')
+      setStatus('idle')
+      return
 
       // Check if user is asking for specific token balance
       if (isSpecificTokenQuery(finalText)) {
@@ -797,6 +824,59 @@ export default function VoiceAssistant({
     setShowTextInput(false)
 
     try {
+      // If we're in a pending direct-send flow, treat a pasted ENS/address as the recipient and send
+      if (directSendRef.current) {
+        const candidate = text.toLowerCase().replace(/\s+/g, '').replace(/[.,;]+$/,'')
+        const isAddr = /^0x[a-f0-9]{40}$/i.test(candidate)
+        const isEns = /^[a-z0-9-]+\.eth$/.test(candidate)
+        if (isAddr || isEns) {
+          directSendRef.current = { ...directSendRef.current, recipient: candidate }
+          setEnsPromptVisible(false)
+          speak('Recipient set. Opening MetaMask to send now.')
+          setStatus('idle')
+          setTimeout(() => { void executeDirectSend() }, 0)
+          return
+        }
+      }
+
+      // Small talk/general questions: reply naturally without forcing a swap
+      const t = text.toLowerCase()
+      const reply = (() => {
+        if (/^(hi|hello|hey|yo|sup)\b/.test(t)) return "Hi! I'm the POHA voice assistant. How can I help today?"
+        if (/\bhow are you\b/.test(t)) return "I'm doing great, thanks for asking! How can I help you with swaps, bridges, or balances?"
+        if (/\bwho are you\b|\bwhat are you\b/.test(t)) return "I'm POHA's voice assistant. I can help swap tokens, bridge across chains, and check wallet balances."
+        if (/\bthank(s| you)\b/.test(t)) return "You're welcome!"
+        if (/\bhelp\b|\bwhat can you do\b|\bhow does this work\b/.test(t)) return "I can understand voice or text to set up swaps and bridges, show balances, and execute the best route through the widget. Try: ‘swap 10 usdc to eth on base’."
+        return null
+      })()
+      if (reply) {
+        speak(reply)
+        setStatus('idle')
+        return
+      }
+
+      // Direct send intent: "send 0.01 usdc to name.eth"
+      const sendMatch = text.match(/\bsend\s+(\d+(?:[.,]\d+)?)\s*([a-z$][a-z0-9$]*)\s+to\s+([a-z0-9-]+\.eth|0x[a-fA-F0-9]{40})\b/i)
+      if (sendMatch) {
+        const amt = parseFloat(sendMatch[1].replace(',', '.'))
+        let sym = normalizeTokenSymbol(sendMatch[2])
+        // Map fiat keyword to stablecoin
+        if (sym === 'USD' || sym === '$') sym = 'USDC'
+        const recipient = sendMatch[3].toLowerCase()
+        directSendRef.current = { amount: amt, symbol: sym, recipient }
+        if (recipient.endsWith('.eth')) {
+          setEnsPromptVisible(true)
+          speak(`Okay, preparing to send ${amt} ${sym} to ${recipient}. I will take 0.01 PYUSD as governance and AI agent fee before proceeding. Please confirm the destination address.`)
+          setStatus('idle')
+          return
+        } else {
+          speak(`Okay, sending ${amt} ${sym} to the provided address. I will take 0.01 PYUSD as governance and AI agent fee before proceeding.`)
+          setStatus('idle')
+          setTimeout(() => { void executeDirectSend() }, 0)
+          return
+        }
+      }
+
       // Check if user is asking for specific token balance
       if (isSpecificTokenQuery(text)) {
         const tokenSymbol = extractTokenFromQuery(text)
@@ -1032,18 +1112,211 @@ export default function VoiceAssistant({
       speak('Destination is Solana. Connect a wallet or paste a Solana address.')
       return
     }
-    // EVM-only: offer ENS once per route
-    if (lastEnsPromptedRouteIdRef.current !== bestRoute.id) {
+    // EVM-only: offer ENS once per route (unless auto-executing a direct send)
+    if (!autoExecuteRef.current && lastEnsPromptedRouteIdRef.current !== bestRoute.id) {
       lastEnsPromptedRouteIdRef.current = bestRoute.id
       setEnsPromptVisible(true)
       speak('Do you want to send to an ENS name? You can type or spell it.')
       return
     }
     // Otherwise, proceed to confirmation
-    listenForExecYesNo()
+    if (autoExecuteRef.current) {
+      // Auto-execute path: skip yes/no and execute directly
+      autoExecuteRef.current = false
+      handleExecConfirm()
+    } else {
+      listenForExecYesNo()
+    }
     // We do not auto-listen here to avoid interrupting user; provide quick confirm UI and allow voice confirm via space again
     // Users can press Space to answer; but we also provide a small confirm bar below.
   }, [bestRoute, execAsking, execStatus, speak, listenForExecYesNo])
+
+  // Announce widget execution failures (e.g., insufficient funds)
+  useEffect(() => {
+    const onFailed = (update: any) => {
+      try {
+        const raw =
+          update?.statusMessage ||
+          update?.error?.message ||
+          update?.message ||
+          (typeof update === 'string' ? update : '')
+        if (!raw) return
+        if (spokenErrorRef.current && Date.now() - spokenErrorRef.current < 2000) return
+        if (isInsufficientFunds(raw)) {
+          spokenErrorRef.current = Date.now()
+          speak("You don't have enough funds to complete the transaction.")
+        } else {
+          // Fall back to a concise generic error
+          spokenErrorRef.current = Date.now()
+          speak('The transaction failed. Please try again or adjust the amount.')
+        }
+      } catch {}
+    }
+    widgetEvents.on(WidgetEvent.RouteExecutionFailed, onFailed as any)
+    return () => {
+      widgetEvents.off(WidgetEvent.RouteExecutionFailed, onFailed as any)
+    }
+  }, [widgetEvents, speak, isInsufficientFunds])
+
+  // Helper: minimal decimal conversion to bigint and ERC-20 transfer builder
+  const toBigIntAmount = (amount: number, decimals: number) => {
+    const s = String(amount)
+    const [w, f = ''] = s.split('.')
+    const frac = (f + '0'.repeat(decimals)).slice(0, decimals)
+    const joined = (w || '0') + frac
+    return BigInt(joined.replace(/^0+/, '') || '0')
+  }
+  const pad32 = (hex: string) => hex.replace(/^0x/, '').padStart(64, '0')
+
+  // PYUSD governance fee config (Ethereum mainnet)
+  const PYUSD_TOKEN = '0x6C3ea9036406852006290770BEdFcAbA0e23A0e8'
+  const PYUSD_DECIMALS = 6
+  const TREASURY = (process.env.NEXT_PUBLIC_TREASURY_ADDRESS || '').toLowerCase()
+
+  // Minimal ERC-20 transfer helper
+  const sendERC20 = useCallback(async (
+    provider: { request: (args: any) => Promise<any> },
+    from: string,
+    token: string,
+    to: string,
+    amount: bigint
+  ) => {
+    const selector = 'a9059cbb' // transfer(address,uint256)
+    const data = '0x' + selector + pad32(to) + pad32('0x' + amount.toString(16))
+    await provider.request({
+      method: 'eth_sendTransaction',
+      params: [{ from, to: token, value: '0x0', data }],
+    })
+  }, [])
+
+  // 0.01% PYUSD governance fee before executing a swap route
+  const chargeGovernanceFee = useCallback(async () => {
+    try {
+      if (!execProposal) return true
+      if (!TREASURY || !/^0x[a-f0-9]{40}$/i.test(TREASURY)) return true
+      const usd = Number((execProposal as any).fromAmountUSD || 0)
+      const nativeAmount = Number((execProposal as any).fromAmount || 0)
+      const feeUSD = usd > 0 ? usd * 0.0001 : nativeAmount * 0.0001
+      if (!(feeUSD > 0)) return true
+      const eth = (typeof window !== 'undefined' ? (window as any).ethereum : null)
+      if (!eth) { speak('No EVM wallet detected to process the governance fee.'); return false }
+      const accounts = (await eth.request({ method: 'eth_requestAccounts' })) as string[]
+      if (!accounts?.length) { speak('Please connect your wallet to process the governance fee.'); return false }
+      await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: '0x1' }] }).catch(() => {})
+      const feeUnits = toBigIntAmount(feeUSD, PYUSD_DECIMALS)
+      if (feeUnits === 0n) return true
+      speak(`I will take ${feeUSD.toFixed(6)} PYUSD as governance fee before fetching the route.`)
+      await sendERC20(eth, accounts[0], PYUSD_TOKEN, TREASURY, feeUnits)
+      return true
+    } catch (e: any) {
+      const msg = (e?.message || '').toLowerCase()
+      if (isInsufficientFunds(msg)) speak("You don't have enough PYUSD to pay the governance fee.")
+      else if (msg.includes('user rejected')) speak('Governance fee transaction rejected.')
+      else speak('Failed to process governance fee.')
+      return false
+    }
+  }, [execProposal, TREASURY, isInsufficientFunds, sendERC20, speak])
+
+  // Flat 0.01 PYUSD fee for direct sends
+  const chargeDirectSendFee = useCallback(async () => {
+    try {
+      if (!directSendRef.current) return true
+      if (!TREASURY || !/^0x[a-f0-9]{40}$/i.test(TREASURY)) return true
+      const eth = (typeof window !== 'undefined' ? (window as any).ethereum : null)
+      if (!eth) { speak('No EVM wallet detected to process the governance fee.'); return false }
+      const accounts = (await eth.request({ method: 'eth_requestAccounts' })) as string[]
+      if (!accounts?.length) { speak('Please connect your wallet to process the governance fee.'); return false }
+      await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: '0x1' }] }).catch(() => {})
+      const feeUnits = toBigIntAmount(0.01, PYUSD_DECIMALS)
+      speak('I will take 0.01 PYUSD as the governance token and AI agent fee before proceeding.')
+      await sendERC20(eth, accounts[0], PYUSD_TOKEN, TREASURY, feeUnits)
+      return true
+    } catch (e: any) {
+      const msg = (e?.message || '').toLowerCase()
+      if (isInsufficientFunds(msg)) speak("You don't have enough PYUSD to pay the governance fee.")
+      else if (msg.includes('user rejected')) speak('Governance fee transaction rejected.')
+      else speak('Failed to process governance fee.')
+      return false
+    }
+  }, [TREASURY, isInsufficientFunds, sendERC20, speak, directSendRef])
+
+  // Canonical mainnet token map to avoid ambiguous resolutions
+  const MAINNET_TOKEN_MAP: Record<string, string> = {
+    USDT: '0xdAC17F958D2ee523a2206206994597C13D831ec7',
+    USDC: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eb48',
+    DAI:  '0x6B175474E89094C44Da98b954EedeAC495271d0F',
+    WETH: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+    WBTC: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599',
+  }
+
+  // Direct EVM send using MetaMask: ERC-20 transfer or native ETH
+  const executeDirectSend = useCallback(async () => {
+    const ctx = directSendRef.current
+    if (!ctx) return
+    const { amount, symbol, recipient } = ctx
+    try {
+      // Charge flat 0.01 PYUSD fee first
+      const feeOk = await chargeDirectSendFee()
+      if (!feeOk) return
+
+      const eth: EIP1193Provider | null =
+        typeof window !== 'undefined' ? ((window as any).ethereum as EIP1193Provider) : null
+      if (!eth) {
+        speak('No EVM wallet detected. Please install MetaMask and try again.')
+        return
+      }
+      const accounts = (await eth.request({ method: 'eth_requestAccounts' })) as string[]
+      if (!accounts?.length) {
+        speak('Please connect your wallet and try again.')
+        return
+      }
+      // Ensure Ethereum mainnet for now
+      await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: '0x1' }] }).catch(() => {})
+
+      if (symbol === 'ETH') {
+        // Native transfer; MetaMask can resolve ENS in "to"
+        const value = '0x' + toBigIntAmount(amount, 18).toString(16)
+        await eth.request({ method: 'eth_sendTransaction', params: [{ from: accounts[0], to: recipient, value }] })
+        speak('Please confirm the transaction in MetaMask.')
+        return
+      }
+
+      const fromChainId = CHAIN_IDS['ethereum']
+      // Prefer canonical address for common tokens on mainnet
+      const canon = MAINNET_TOKEN_MAP[symbol.toUpperCase()]
+      let tokenAddress: string | undefined
+      let tokenDecimals: number | undefined
+      if (canon) {
+        tokenAddress = canon
+        // Hardcode common decimals
+        tokenDecimals = symbol.toUpperCase() === 'USDT' ? 6
+          : symbol.toUpperCase() === 'USDC' ? 6
+          : symbol.toUpperCase() === 'DAI' ? 18
+          : symbol.toUpperCase() === 'WETH' ? 18
+          : symbol.toUpperCase() === 'WBTC' ? 8 : 18
+      } else {
+        const token = await resolveToken(fromChainId, symbol)
+        tokenAddress = token?.address
+        tokenDecimals = typeof token?.decimals === 'number' ? token.decimals : undefined
+      }
+      if (!tokenAddress || typeof tokenDecimals !== 'number') {
+        speak('I could not resolve the token address. Please try again.')
+        return
+      }
+      const amt = toBigIntAmount(amount, tokenDecimals)
+      const selector = 'a9059cbb' // transfer(address,uint256)
+      const data = '0x' + selector + pad32(recipient) + pad32('0x' + amt.toString(16))
+      await eth.request({ method: 'eth_sendTransaction', params: [{ from: accounts[0], to: tokenAddress, value: '0x0', data }] })
+      speak('Please confirm the token transfer in MetaMask.')
+    } catch (e: any) {
+      const msg = (e?.message || '').toLowerCase()
+      if (isInsufficientFunds(msg)) speak("You don't have enough funds to complete the transaction.")
+      else if (msg.includes('user rejected')) speak('Transaction rejected in wallet.')
+      else speak('Failed to send. Please try again.')
+    } finally {
+      directSendRef.current = null
+    }
+  }, [isInsufficientFunds, speak])
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -1278,9 +1551,26 @@ export default function VoiceAssistant({
         }
       }
 
+      // Governance fee in PYUSD before executing
+      const okFee = await chargeGovernanceFee()
+      if (!okFee) return
       speak(`Starting the swap via ${dex}. Please confirm the transaction in your wallet.`)
       await execute(execProposal)
       speak('Swap executed successfully.')
+      try {
+        appendTx({
+          id: execProposal.id || String(Date.now()),
+          ts: Date.now(),
+          status: 'completed',
+          fromChainId: execProposal.fromChainId,
+          toChainId: execProposal.toChainId,
+          fromSymbol: execProposal.fromToken?.symbol,
+          toSymbol: execProposal.toToken?.symbol,
+          amount: Number(execProposal.fromAmountUSD || execProposal.fromAmount || 0),
+          dex: dex,
+          routeId: execProposal.id,
+        })
+      } catch {}
       // Clear execution state after success
       setExecProposal(null)
       setExecAsking(false)
@@ -1289,12 +1579,28 @@ export default function VoiceAssistant({
       const m = e instanceof Error ? e.message : String(e)
       console.error('Route execution failed:', e)
       const ml = m.toLowerCase()
-      const msg = ml.includes('not connected') || ml.includes('account is not connected')
-        ? 'Please connect your wallet to execute the swap.'
-        : ml.includes('user rejected') || ml.includes('user rejected the request')
-          ? 'Transaction rejected in wallet.'
-          : 'Execution failed. Please try again.'
+      const msg = isInsufficientFunds(ml)
+        ? "You don't have enough funds to complete the transaction."
+        : ml.includes('not connected') || ml.includes('account is not connected')
+          ? 'Please connect your wallet to execute the swap.'
+          : ml.includes('user rejected') || ml.includes('user rejected the request')
+            ? 'Transaction rejected in wallet.'
+            : 'Execution failed. Please try again.'
       speak(msg)
+      try {
+        if (execProposal) appendTx({
+          id: execProposal.id || String(Date.now()),
+          ts: Date.now(),
+          status: 'failed',
+          fromChainId: execProposal.fromChainId,
+          toChainId: execProposal.toChainId,
+          fromSymbol: execProposal.fromToken?.symbol,
+          toSymbol: execProposal.toToken?.symbol,
+          amount: Number(execProposal.fromAmountUSD || execProposal.fromAmount || 0),
+          dex: getBestDexInfo(execProposal)?.name || 'route',
+          routeId: execProposal.id,
+        })
+      } catch {}
     }
   }
 
@@ -1441,6 +1747,22 @@ export default function VoiceAssistant({
             </button>
           )}
 
+          {status === 'listening' && liveTranscript.trim() && (
+            <button
+              className={"va-keyboard active"}
+              onClick={() => {
+                setShowTextInput(true)
+                setTextInput(liveTranscript)
+              }}
+              aria-label="Edit current transcript"
+            >
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M4 17.5V20h2.5L17.81 8.69l-2.5-2.5L4 17.5z" fill="currentColor"/>
+                <path d="M20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 2.5 2.5 1.08-1.08z" fill="currentColor"/>
+              </svg>
+            </button>
+          )}
+
           {/* Stop speaking button - shows when speaking */}
           {isSpeaking && (
             <button
@@ -1456,7 +1778,13 @@ export default function VoiceAssistant({
 
           <button
             className={"va-keyboard" + (showTextInput ? ' active' : '')}
-            onClick={() => setShowTextInput(!showTextInput)}
+            onClick={() => {
+              if (!showTextInput) {
+                const seed = textInput || (liveTranscript || transcript)
+                if (seed) setTextInput(seed)
+              }
+              setShowTextInput(!showTextInput)
+            }}
             disabled={!verified}
             aria-label="Type text (press T)"
           >
@@ -1549,14 +1877,29 @@ export default function VoiceAssistant({
         onCancel={() => {
           setEnsPromptVisible(false)
           // After skipping ENS, proceed to ask for execution
-          listenForExecYesNo()
+          if (directSendRef.current) {
+            speak('ENS address not provided. Please paste a wallet address to proceed.')
+          } else {
+            listenForExecYesNo()
+          }
         }}
         onConfirm={(address) => {
-          // Set widget recipient and execute
-          formRef.current?.setFieldValue('toAddress', address)
-          setEnsPromptVisible(false)
-          speak('ENS recipient set. Proceeding to execute.')
-          handleExecConfirm()
+          if (directSendRef.current) {
+            // Direct send flow
+            directSendRef.current = {
+              ...directSendRef.current,
+              recipient: address,
+            }
+            setEnsPromptVisible(false)
+            speak('Recipient set. Opening MetaMask to send now.')
+            setTimeout(() => { void executeDirectSend() }, 0)
+          } else {
+            // Widget flow
+            formRef.current?.setFieldValue('toAddress', address)
+            setEnsPromptVisible(false)
+            speak('ENS recipient set. Proceeding to execute.')
+            handleExecConfirm()
+          }
         }}
         onSpell={spellEnsByVoice}
       />

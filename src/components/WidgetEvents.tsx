@@ -7,6 +7,7 @@ import type {
 } from '@lifi/widget'
 import { useWidgetEvents, WidgetEvent } from '@lifi/widget'
 import { useEffect } from 'react'
+import { appendTx } from './TransactionHistory'
 
 export const WidgetEvents = () => {
   const widgetEvents = useWidgetEvents()
@@ -18,11 +19,38 @@ export const WidgetEvents = () => {
     const onRouteExecutionUpdated = (_update: RouteExecutionUpdate) => {
       console.log('onRouteExecutionUpdated fired.')
     }
-    const onRouteExecutionCompleted = (_route: Route) => {
-      console.log('onRouteExecutionCompleted fired.')
+    const onRouteExecutionCompleted = (route: Route) => {
+      try {
+        appendTx({
+          id: route.id || String(Date.now()),
+          ts: Date.now(),
+          status: 'completed',
+          fromChainId: route.fromChainId,
+          toChainId: route.toChainId,
+          fromSymbol: route.fromToken?.symbol,
+          toSymbol: route.toToken?.symbol,
+          amount: Number((route as any).fromAmountUSD || (route as any).fromAmount || 0),
+          dex: (route as any)?.steps?.[0]?.toolDetails?.name || (route as any)?.steps?.[0]?.tool,
+          routeId: route.id,
+        })
+      } catch {}
     }
-    const onRouteExecutionFailed = (_update: RouteExecutionUpdate) => {
-      console.log('onRouteExecutionFailed fired.')
+    const onRouteExecutionFailed = (update: RouteExecutionUpdate) => {
+      try {
+        const route = update.route as unknown as Route
+        appendTx({
+          id: route?.id || String(Date.now()),
+          ts: Date.now(),
+          status: 'failed',
+          fromChainId: route?.fromChainId,
+          toChainId: route?.toChainId,
+          fromSymbol: route?.fromToken?.symbol,
+          toSymbol: route?.toToken?.symbol,
+          amount: Number((route as any)?.fromAmountUSD || (route as any)?.fromAmount || 0),
+          dex: (route as any)?.steps?.[0]?.toolDetails?.name || (route as any)?.steps?.[0]?.tool,
+          routeId: route?.id,
+        })
+      } catch {}
     }
     const onRouteHighValueLoss = (_update: RouteHighValueLossUpdate) => {
       console.log('onRouteHighValueLoss continued.')

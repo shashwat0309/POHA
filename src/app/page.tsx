@@ -1,10 +1,14 @@
 import { Widget } from '@/components/Widget'
 import { WidgetEvents } from '@/components/WidgetEvents'
 import Link from 'next/link'
+import { UserGreeting } from '@/components/UserGreeting'
+import TransactionHistory from '@/components/TransactionHistory'
 
 export default function Home() {
   return (
     <main>
+      <UserGreeting />
+      <TransactionHistory />
       <div style={{ position: 'absolute', top: '20px', right: '20px', zIndex: 1000 }}>
         <Link
           href="/voice-test"
