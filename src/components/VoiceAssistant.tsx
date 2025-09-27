@@ -90,6 +90,7 @@ export default function VoiceAssistant({
   const [isSpeaking, setIsSpeaking] = useState(false)
   const [lastResponse, setLastResponse] = useState('')
   const [messages, setMessages] = useState<{ role: 'user' | 'assistant'; text: string; ts: number }[]>([])
+  const [verified, setVerified] = useState(false)
   const [pendingField, setPendingField] = useState<keyof Intent | null>(null)
 
   // Chat history helpers
@@ -102,6 +103,19 @@ export default function VoiceAssistant({
     const t = (typeof text === 'string' ? text : '').trim()
     if (!t) return
     setMessages((prev) => [...prev, { role: 'assistant', text: t, ts: Date.now() }])
+  }, [])
+
+  // Load verification status on startup and subscribe to changes
+  useEffect(() => {
+    try {
+      const v = typeof window !== 'undefined' ? localStorage.getItem('poha_verified') : null
+      setVerified(v === 'true')
+    } catch {}
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'poha_verified') setVerified(e.newValue === 'true')
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
   }, [])
 
   // Helpers to interpret short answers for the pending field prompt
@@ -319,6 +333,10 @@ export default function VoiceAssistant({
 
   // Process current live transcript
   const processCurrentTranscript = useCallback(async () => {
+    if (!verified) {
+      speak('Please verify your identity to proceed.')
+      return
+    }
     if (!liveTranscript.trim()) return
 
     // Stop current recording
@@ -555,6 +573,10 @@ export default function VoiceAssistant({
   }, [])
 
   const startRecording = useCallback(async () => {
+    if (!verified) {
+      speak('Please verify your identity to use voice assistant.')
+      return
+    }
     if (status !== 'idle') return
     try {
       setStatus('listening')
@@ -576,7 +598,7 @@ export default function VoiceAssistant({
       setStatus('idle')
       setIsTranscribing(false)
     }
-  }, [status, startLiveTranscription])
+  }, [status, startLiveTranscription, verified, speak])
 
   const stopAndProcess = useCallback(async () => {
     const rec = recorderRef.current
@@ -1321,7 +1343,7 @@ export default function VoiceAssistant({
     } finally {
       setStatus('idle')
     }
-  }, [transcribeLang, addUserMessage])
+  }, [transcribeLang, addUserMessage, verified, speak])
 
   return (
     <div className="va-root" aria-live="polite">
@@ -1395,6 +1417,7 @@ export default function VoiceAssistant({
             onMouseUp={stopAndProcess}
             onTouchStart={startRecording}
             onTouchEnd={stopAndProcess}
+            disabled={!verified}
             aria-label="Push to talk (hold Space)"
           >
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -1434,6 +1457,7 @@ export default function VoiceAssistant({
           <button
             className={"va-keyboard" + (showTextInput ? ' active' : '')}
             onClick={() => setShowTextInput(!showTextInput)}
+            disabled={!verified}
             aria-label="Type text (press T)"
           >
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -1443,6 +1467,13 @@ export default function VoiceAssistant({
           </button>
         </div>
       </div>
+
+      {!verified && (
+        <div className="va-verify">
+          <div className="va-verify-text">Verification required to use voice features.</div>
+          <button className="va-btn primary small" onClick={() => (window.location.href = '/verify')}>Verify</button>
+        </div>
+      )}
 
       {showTextInput && (
         <div className="va-text-input">
@@ -1576,6 +1607,8 @@ export default function VoiceAssistant({
         .va-user { opacity: .8; }
         .va-reply { color: #e2e8f0; opacity: .95; }
         .va-actions { display: flex; gap: 8px; }
+        .va-verify { pointer-events: auto; margin: 8px 0 0; padding: 10px 12px; border-radius: 12px; background: rgba(15,118,110,0.25); border: 1px solid rgba(45,212,191,0.35); display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+        .va-verify-text { font-size: 13px; }
         .va-history { pointer-events: auto; margin: 8px 0 0; padding: 8px 10px; border-radius: 12px; background: rgba(18,18,20,0.45); border: 1px solid rgba(255,255,255,0.08); max-height: 180px; overflow: auto; }
         .va-history-head { display: flex; align-items: center; justify-content: space-between; padding: 2px 0 6px; }
         .va-history-title { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; opacity: .7; }
