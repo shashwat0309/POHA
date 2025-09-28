@@ -9,6 +9,7 @@ Contents
 - Wallet Feature Extensions
 - Automating Swaps & Bridges
 - Wallet Monitoring
+ - Related Docs
 
 ## Problem & Vision
 People want a single, smooth experience to verify their identity, connect any wallet, swap assets, bridge across chains, and pay small fees to a treasury — without juggling multiple dapps or manual steps. POHA Agent provides an intent-driven assistant that automates these actions safely and transparently.
@@ -128,8 +129,3 @@ Assistant (user)
 - “Send 5 PYUSD to treasury for fees.”
 - “Verify me with SELF and mint the SBT.”
 - “Show my last 5 transactions and any pending ones.”
-
-Dev/testing
-- “Use RPC_URL=<your rpc> and PRIVATE_KEY=<your key>, then mint SBT for my wallet.”
-- “Simulate a stuck tx and retry with higher gas.”
-- “Resolve ‘vitalik.eth’ and swap 0.1 ETH to USDC on mainnet.”
