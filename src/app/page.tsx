@@ -3,12 +3,16 @@ import { WidgetEvents } from '@/components/WidgetEvents'
 import Link from 'next/link'
 import { UserGreeting } from '@/components/UserGreeting'
 import TransactionHistory from '@/components/TransactionHistory'
+import PromptsHelp from '@/components/PromptsHelp'
+import ConnectWalletButton from '@/components/ConnectWalletButton'
 
 export default function Home() {
   return (
     <main>
+      <ConnectWalletButton />
       <UserGreeting />
       <TransactionHistory />
+      <PromptsHelp />
       <div style={{ position: 'absolute', top: '20px', right: '20px', zIndex: 1000 }}>
         <Link
           href="/voice-test"

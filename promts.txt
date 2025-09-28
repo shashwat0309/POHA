@@ -1,0 +1,9 @@
+POHA Voice/Chat Prompt Cheatsheet
+
+Basic actions
+- "Swap 25 USDC to ETH on Base"
+- "Swap 0.5 ETH to USDC on Ethereum"
+- "Send 0.01 USDT to Address.eth"
+- "Show my wallet holdings"
+- "What is my USDT balance?"
+- "Bridge 1 USDC from ETH to Arbitrum and swap to ETH"

@@ -91,6 +91,7 @@ export default function VoiceAssistant({
   const [bestRoute, setBestRoute] = useState<Route | null>(null)
   const [execProposal, setExecProposal] = useState<Route | null>(null)
   const [execAsking, setExecAsking] = useState(false)
+  const [errorBanner, setErrorBanner] = useState<string>('')
   const lastPromptedRouteIdRef = useRef<string | null>(null)
   const [ensPromptVisible, setEnsPromptVisible] = useState(false)
   const lastEnsPromptedRouteIdRef = useRef<string | null>(null)
@@ -824,6 +825,40 @@ export default function VoiceAssistant({
     setShowTextInput(false)
 
     try {
+      // If a specific field was pending, only apply that field from the answer
+      if (pendingField) {
+        const patch = parsePendingAnswer(text)
+        if (Object.keys(patch).length) {
+          const merged = { ...intent, ...patch }
+          setIntent(merged)
+          setPendingField(null)
+          const missing = getMissingField(merged)
+          if (missing) {
+            setPendingField(missing)
+            speak(questionForField[missing])
+          } else {
+            speak('Great, I have everything I need. Finding the best route.')
+            // We defer to the normal intent handling on next input/confirmation
+          }
+          setStatus('idle')
+          return
+        }
+      }
+      // Quick confirms for swap/execute intents
+      const lower = text.toLowerCase()
+      if (/(do the swap|execute|confirm|go ahead|please proceed|start swap|swap now|yes)$/i.test(lower)) {
+        if (proposal) {
+          handleConfirm()
+          setStatus('idle')
+          return
+        }
+        if (execProposal) {
+          await handleExecConfirm()
+          setStatus('idle')
+          return
+        }
+      }
+
       // If we're in a pending direct-send flow, treat a pasted ENS/address as the recipient and send
       if (directSendRef.current) {
         const candidate = text.toLowerCase().replace(/\s+/g, '').replace(/[.,;]+$/,'')
@@ -1043,7 +1078,15 @@ export default function VoiceAssistant({
   // Listen for available routes and selection to show a small best route card
   useEffect(() => {
     const onAvailable = (routes: Route[]) => {
-      if (routes && routes.length > 0) setBestRoute(routes[0])
+      if (routes && routes.length > 0) {
+        setBestRoute(routes[0])
+        if (errorBanner) setErrorBanner('')
+      } else {
+        const msg = 'No routes available. Reasons: low liquidity, amount too low, high gas, or unsupported combination.'
+        setBestRoute(null)
+        setErrorBanner(msg)
+        speak(msg)
+      }
     }
     const onSelected = ({ route }: { route: Route }) => {
       setBestRoute(route)
@@ -1098,6 +1141,16 @@ export default function VoiceAssistant({
     setExecAsking(true)
     lastPromptedRouteIdRef.current = bestRoute.id
     speak(msg)
+    // Announce governance fee once per route when we have USD amount
+    try {
+      const usd = Number((bestRoute as any).fromAmountUSD || 0)
+      if (usd > 0) {
+        const feeUSD = usd * 0.0001
+        speak(`Note: a governance and AI agent fee of ${feeUSD.toFixed(6)} PYUSD will be charged before execution.`)
+      } else {
+        speak('Note: a 0.01% PYUSD governance fee will be charged before execution.')
+      }
+    } catch {}
     const toIsSol = bestRoute.toChainId === ChainId.SOL
     const fromIsSol = bestRoute.fromChainId === ChainId.SOL
     if (fromIsSol) {
@@ -1144,11 +1197,15 @@ export default function VoiceAssistant({
         if (spokenErrorRef.current && Date.now() - spokenErrorRef.current < 2000) return
         if (isInsufficientFunds(raw)) {
           spokenErrorRef.current = Date.now()
-          speak("You don't have enough funds to complete the transaction.")
+          const msg = "You don't have enough funds to complete the transaction."
+          setErrorBanner(msg)
+          speak(msg)
         } else {
           // Fall back to a concise generic error
           spokenErrorRef.current = Date.now()
-          speak('The transaction failed. Please try again or adjust the amount.')
+          const msg = 'The transaction failed. Please try again or adjust the amount.'
+          setErrorBanner(msg)
+          speak(msg)
         }
       } catch {}
     }
@@ -1406,6 +1463,8 @@ export default function VoiceAssistant({
       speak('That is the same token on the same chain. Please change the token or destination chain.')
       return
     }
+    // Let the user know about the governance fee upfront
+    speak('Note: a 0.01% PYUSD governance fee will be charged before execution.')
     formRef.current?.setFieldValue('fromChain', proposal.fromChainId)
     formRef.current?.setFieldValue('fromToken', proposal.fromTokenAddress)
     formRef.current?.setFieldValue('fromAmount', String(proposal.amount))
@@ -1933,6 +1992,13 @@ export default function VoiceAssistant({
 
       <BestRouteCard route={bestRoute} />
 
+      {errorBanner && (
+        <div className="va-error">
+          {errorBanner}
+          <button className="va-btn small secondary" onClick={() => setErrorBanner('')} style={{ marginLeft: 8 }}>Dismiss</button>
+        </div>
+      )}
+
       <WalletHoldings
         visible={showWalletHoldings}
         onClose={() => setShowWalletHoldings(false)}
@@ -1993,6 +2059,7 @@ export default function VoiceAssistant({
         .va-btn.secondary { background: rgba(255,255,255,0.08); }
         .va-btn[disabled] { opacity: .6; cursor: not-allowed; }
         .va-btn.small { padding: 6px 12px; font-size: 12px; }
+        .va-error { pointer-events: auto; margin: 10px 0 0; padding: 10px 12px; border-radius: 12px; background: rgba(239,68,68,0.18); border: 1px solid rgba(239,68,68,0.35); color: #fecaca; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
         .va-text-input { pointer-events: auto; margin-top: 10px; display: flex; flex-direction: column; gap: 10px; padding: 12px 14px; border-radius: 14px; background: rgba(18,18,20,0.6); border: 1px solid rgba(255,255,255,0.08); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
         .va-text-field { width: 100%; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; background: rgba(255,255,255,0.05); color: #fff; font-size: 14px; font-family: inherit; }
         .va-text-field:focus { outline: none; border-color: #4F46E5; box-shadow: 0 0 0 2px rgba(79,70,229,0.2); }

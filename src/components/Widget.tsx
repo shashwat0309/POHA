@@ -2,7 +2,7 @@
 
 import type { WidgetConfig } from '@lifi/widget'
 import { ChainId } from '@lifi/sdk'
-import { LiFiWidget, WidgetSkeleton } from '@lifi/widget'
+import { LiFiWidget } from '@lifi/widget'
 import { ClientOnly } from './ClientOnly'
 import { useRef } from 'react'
 import VoiceAssistant from './VoiceAssistant'
@@ -35,10 +35,13 @@ export function Widget() {
   } as Partial<WidgetConfig>
 
   return (
-    <ClientOnly fallback={<WidgetSkeleton config={config} />}>
+    <ClientOnly fallback={null}>
       <div style={{ display: 'grid', gap: 16 }}>
         <VoiceAssistant formRef={formRef} />
-        <LiFiWidget config={config} integrator="nextjs-example" formRef={formRef} />
+        {/* Keep the LiFi widget mounted but hidden, so voice assistant can drive it */}
+        <div style={{ position: 'absolute', left: -99999, top: 0, width: 1, height: 1, overflow: 'hidden' }} aria-hidden>
+          <LiFiWidget config={config} integrator="nextjs-example" formRef={formRef} />
+        </div>
       </div>
     </ClientOnly>
   )

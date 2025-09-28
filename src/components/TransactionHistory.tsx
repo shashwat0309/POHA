@@ -24,7 +24,7 @@ export function appendTx(record: TxRecord) {
     list.unshift(record)
     localStorage.setItem(STORAGE_KEY, JSON.stringify(list.slice(0, 50)))
     window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY, newValue: JSON.stringify(list.slice(0, 50)) }))
-  } catch {}
+  } catch { }
 }
 
 export default function TransactionHistory() {
@@ -35,12 +35,12 @@ export default function TransactionHistory() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY)
       setItems(raw ? JSON.parse(raw) : [])
-    } catch {}
+    } catch { }
     const onStorage = (e: StorageEvent) => {
       if (e.key === STORAGE_KEY) {
         try {
           setItems(e.newValue ? JSON.parse(e.newValue) : [])
-        } catch {}
+        } catch { }
       }
     }
     window.addEventListener('storage', onStorage)
@@ -54,7 +54,7 @@ export default function TransactionHistory() {
 
   return (
     <>
-      <div style={{ position: 'fixed', right: 16, top: 20, zIndex: 1000 }}>
+      <div style={{ position: 'fixed', left: 16, top: 20, zIndex: 1000 }}>
         <button
           onClick={() => setOpen((v) => !v)}
           style={{
@@ -73,7 +73,7 @@ export default function TransactionHistory() {
         <div style={{
           position: 'fixed',
           top: 70,
-          right: 16,
+          left: 16,
           width: 320,
           maxHeight: '70vh',
           overflow: 'auto',
@@ -82,19 +82,24 @@ export default function TransactionHistory() {
           border: '1px solid rgba(255,255,255,0.1)',
           background: 'rgba(18,18,24,0.65)',
           color: '#e7e7ea',
-          backdropFilter: 'blur(10px)'
+          backdropFilter: 'blur(10px)',
+          display: 'flex',
+          flexDirection: 'column',
         }}>
           <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>Transactions</div>
           {formatted.length === 0 ? (
             <div style={{ opacity: .8, fontSize: 13 }}>No transactions yet.</div>
           ) : (
-            formatted.map((r) => (
+            formatted.map((r, idx) => (
               <div key={r.id} style={{
                 border: '1px solid rgba(255,255,255,0.08)',
                 borderRadius: 10,
                 padding: 10,
                 marginBottom: 8,
-                background: 'rgba(255,255,255,0.03)'
+                background: 'rgba(255,255,255,0.03)',
+                // Make the most recent (first) card appear on the right side visually
+                alignSelf: idx === 0 ? 'flex-end' : 'stretch',
+                maxWidth: idx === 0 ? '92%' : '100%'
               }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
                   <span style={{ fontSize: 12, opacity: .8 }}>{r.when}</span>
@@ -124,4 +129,3 @@ export default function TransactionHistory() {
     </>
   )
 }
-
